@@ -1,0 +1,1 @@
+CREATE DATABASE strategy_service;

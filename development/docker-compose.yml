@@ -1,0 +1,21 @@
+services:
+
+  database:
+    image: postgres:alpine
+    command: postgres -c 'max_connections=2000'
+    container_name: strategy-postgres
+    ports:
+      - 5432:5432
+    volumes:
+      - ./init-db:/docker-entrypoint-initdb.d
+    environment:
+      POSTGRES_DB: ${DB_NAME:-strategy_service}
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+      PGDATA: /data/postgres
+    restart: always
+    networks:
+      - strategy
+
+networks:
+  strategy:
