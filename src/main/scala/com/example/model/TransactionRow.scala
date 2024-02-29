@@ -5,10 +5,19 @@ import java.util.UUID
 
 case class TransactionRow(
   id: UUID,
-  limitOrderId: String,
-  market: String,
-  side: Side,
+  orderId: String, // the same as OrderRow
   amount: BigDecimal,
-  status: Status,
   createdAt: Instant
 )
+
+object TransactionRow {
+
+  def apply(state: OrderRow, updated: OrderRow): TransactionRow = {
+    TransactionRow(
+      id = UUID.randomUUID(), // generate some id for our transaction
+      orderId = state.orderId,
+      amount = state.filled,
+      createdAt = Instant.now()
+    )
+  }
+}

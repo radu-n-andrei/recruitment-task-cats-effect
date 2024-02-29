@@ -1,7 +1,7 @@
 package com.example.persistence
 
 import cats.effect.Resource
-import com.example.model.{OrderRow, Status, TransactionRow}
+import com.example.model.{OrderRow, TransactionRow}
 import skunk._
 
 final case class PreparedQueries[F[_]](
@@ -9,7 +9,7 @@ final case class PreparedQueries[F[_]](
   insertOrder: PreparedCommand[F, OrderRow],
   getOrder: PreparedQuery[F, String, OrderRow],
   getAllOrders: PreparedQuery[F, Void, OrderRow],
-  updateOrder: PreparedCommand[F, BigDecimal *: Status *: String *: EmptyTuple],
+  updateOrder: PreparedCommand[F, BigDecimal *: String *: EmptyTuple],
   insertTransaction: PreparedCommand[F, TransactionRow]
 )
 

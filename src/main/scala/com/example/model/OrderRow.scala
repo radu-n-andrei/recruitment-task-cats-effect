@@ -5,11 +5,8 @@ import java.time.Instant
 case class OrderRow(
   orderId: String,
   market: String,
-  side: Side,
-  price: BigDecimal,
   total: BigDecimal,
-  filled: BigDecimal,
-  status: Status,
+  filled: BigDecimal, //state of completion of the order
   createdAt: Instant,
   updatedAt: Instant
 )

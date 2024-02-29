@@ -7,31 +7,24 @@ import cats.effect.std.Queue
 import fs2.Stream
 import org.typelevel.log4cats.Logger
 import cats.syntax.all._
-import com.example.model.{OrderRow, TransactionRow, Update}
+import com.example.model.{OrderRow, TransactionRow}
 import com.example.persistence.PreparedQueries
 import skunk._
 
 import scala.concurrent.duration.FiniteDuration
 
+// All SQL queries inside the Queries object are correct and should not be changed
 final class TransactionStream[F[_]](
   operationTimer: FiniteDuration,
-  orders: Queue[F, Update],
+  orders: Queue[F, OrderRow],
   session: Resource[F, Session[F]],
-  counter: Ref[F, Int], // transaction counter
-  stateManager: StateManager[F]
+  transactionCounter: Ref[F, Int], // updated if long IO succeeds
+  stateManager: StateManager[F]    // utility for state management
 )(implicit F: Async[F], logger: Logger[F]) {
-
-  // helper methods for testing
-  def publish(update: Update): F[Unit]                                            = orders.offer(update)
-  def getCounter: F[Int]                                                          = counter.get
-  def setSwitch(value: Boolean): F[Unit]                                          = stateManager.setSwitch(value)
-  def addNewOrder(order: OrderRow, insert: PreparedCommand[F, OrderRow]): F[Unit] = stateManager.add(order, insert)
-  // helper methods for testing
 
   def stream: Stream[F, Unit] = {
     Stream
       .fromQueueUnterminated(orders)
-      .dropWhile(_.sequence < 0)
       .evalMap(processUpdate)
   }
 
@@ -39,19 +32,18 @@ final class TransactionStream[F[_]](
   // If performLongRunningOperation fails, we don't want to insert/update the records
   // Transactions always have positive amount
   // Order is executed if total == filled
-  private def processUpdate(update: Update): F[Unit] = {
+  private def processUpdate(updatedOrder: OrderRow): F[Unit] = {
     PreparedQueries(session)
       .use { queries =>
         for {
-          // db operation 1
-          order       <- stateManager.getOrderState(update, queries)
-          transaction <- F.pure(update.toTransaction(order))
-          orderFromUpdate = update.toOrder(order)
+          // Get current known order state
+          state <- stateManager.getOrderState(updatedOrder, queries)
+          transaction = TransactionRow(state = state, updated = updatedOrder)
           // parameters for order update
-          params = orderFromUpdate.total *: order.status *: order.orderId *: EmptyTuple
-          // db operation 2
+          params = state.filled *: state.orderId *: EmptyTuple
+          // update order with params
           _ <- queries.updateOrder.execute(params)
-          // db operation 3
+          // insert the transaction
           _ <- queries.insertTransaction.execute(transaction)
           _ <- performLongRunningOperation(transaction).value.void.handleErrorWith(th =>
                  logger.error(th)(s"Got error when performing long running IO!")
@@ -66,17 +58,24 @@ final class TransactionStream[F[_]](
       F.sleep(operationTimer) *>
         stateManager.getSwitch.flatMap {
           case false =>
-            counter
-              .getAndUpdate(_ + 1)
+            transactionCounter
+              .updateAndGet(_ + 1)
               .flatMap(count =>
                 logger.info(
-                  s"Updated counter to $count by transaction with id ${transaction.id} for ${transaction.market}!"
+                  s"Updated counter to $count by transaction with amount ${transaction.amount} for order ${transaction.orderId}!"
                 )
               )
           case true => F.raiseError(throw new Exception("Long running IO failed!"))
         }
     )
   }
+
+  // helper methods for testing
+  def publish(update: OrderRow): F[Unit]                                          = orders.offer(update)
+  def getCounter: F[Int]                                                          = transactionCounter.get
+  def setSwitch(value: Boolean): F[Unit]                                          = stateManager.setSwitch(value)
+  def addNewOrder(order: OrderRow, insert: PreparedCommand[F, OrderRow]): F[Unit] = stateManager.add(order, insert)
+  // helper methods for testing
 }
 
 object TransactionStream {
@@ -88,7 +87,7 @@ object TransactionStream {
     Resource.eval {
       for {
         counter      <- Ref.of(0)
-        queue        <- Queue.unbounded[F, Update]
+        queue        <- Queue.unbounded[F, OrderRow]
         stateManager <- StateManager.apply
       } yield new TransactionStream[F](
         operationTimer,
