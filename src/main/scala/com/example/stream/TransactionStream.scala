@@ -3,6 +3,7 @@ package com.example.stream
 import cats.data.EitherT
 import cats.effect.{Ref, Resource}
 import cats.effect.kernel.Async
+import cats.effect.kernel.Resource.ExitCase
 import cats.effect.std.Queue
 import fs2.Stream
 import org.typelevel.log4cats.Logger
@@ -26,36 +27,48 @@ final class TransactionStream[F[_]](
     Stream
       .fromQueueUnterminated(orders)
       .evalMap(processUpdate)
+      .onFinalize(
+        streamRemaining
+      )
+    /* .onFinalizeCase { case ExitCase.Succeeded => logger.info("SUCCEED") case ExitCase.Errored(e) =>
+     * logger.info("ERRRRR") case ExitCase.Canceled => logger.info("CANCELLED") } */
   }
+
+  private def streamRemaining: F[Unit] =
+    orders.size.flatMap { s =>
+      Stream.fromQueueUnterminated(orders).evalMap(processUpdate).take(s).compile.drain
+    }
 
   // Application should shut down on error,
   // If performLongRunningOperation fails, we don't want to insert/update the records
   // Transactions always have positive amount
   // Order is executed if total == filled
   private def processUpdate(updatedOrder: OrderRow): F[Unit] = {
-    PreparedQueries(session)
-      .use { queries =>
-        for {
-          // Get current known order state
-          state <- stateManager.getOrderState(updatedOrder, queries)
-          transaction = TransactionRow(state = state, updated = updatedOrder)
-          // parameters for order update
-          params = updatedOrder.filled *: state.orderId *: EmptyTuple
-          _ <- if (updatedOrder.filled > 0)
-                 performLongRunningOperation(transaction)
-                   .foldF(
-                     t => logger.warn(t)("Long running operation failed"), // nothing on left yet
-                     _ =>
-                       if (updatedOrder.filled != state.filled)
-                         queries.insertTransaction.execute(transaction).void >> // might need to check that both work
-                           queries.updateOrder.execute(params).void
-                       else F.unit
-                   )
-                   .void
-                   .handleErrorWith(th => logger.error(th)(s"Got error when performing long running IO!"))
-               else F.unit
-        } yield ()
-      }
+    F.uncancelable(_ =>
+      PreparedQueries(session)
+        .use { queries =>
+          for {
+            // Get current known order state
+            state <- stateManager.getOrderState(updatedOrder, queries)
+            transaction = TransactionRow(state = state, updated = updatedOrder)
+            // parameters for order update
+            params = updatedOrder.filled *: state.orderId *: EmptyTuple
+            _ <- if (updatedOrder.filled > 0)
+                   performLongRunningOperation(transaction)
+                     .foldF(
+                       t => logger.warn(t)("Long running operation failed"), // nothing on left yet
+                       _ =>
+                         if (updatedOrder.filled != state.filled)
+                           queries.insertTransaction.execute(transaction).void >> // might need to check that both work
+                             queries.updateOrder.execute(params).void
+                         else F.unit
+                     )
+                     .void
+                     .handleErrorWith(th => logger.error(th)(s"Got error when performing long running IO!"))
+                 else F.unit
+          } yield ()
+        }
+    )
   }
 
   // FIXME is the transaction actor really tied to the success of the "long running operation" ???
@@ -89,6 +102,25 @@ final class TransactionStream[F[_]](
 object TransactionStream {
 
   def apply[F[_]: Async: Logger](
+    operationTimer: FiniteDuration,
+    session: Resource[F, Session[F]]
+  ): Resource[F, TransactionStream[F]] = {
+    Resource.make {
+      for {
+        counter      <- Ref.of(0)
+        queue        <- Queue.unbounded[F, OrderRow]
+        stateManager <- StateManager.apply
+      } yield new TransactionStream[F](
+        operationTimer,
+        queue,
+        session,
+        counter,
+        stateManager
+      )
+    }(_.streamRemaining)
+  }
+
+  def apply2[F[_]: Async: Logger](
     operationTimer: FiniteDuration,
     session: Resource[F, Session[F]]
   ): Resource[F, TransactionStream[F]] = {
