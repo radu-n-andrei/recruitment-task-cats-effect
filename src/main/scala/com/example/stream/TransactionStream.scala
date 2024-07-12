@@ -8,7 +8,8 @@ import cats.syntax.all._
 import com.example.model.{OrderRow, TransactionRow}
 import com.example.persistence.PreparedQueries
 import com.example.stream.StateManager.OrderNotFoundException
-import fs2.Stream
+import com.example.stream.TransactionStream.ValidationException
+import fs2.{Pipe, Stream}
 import org.typelevel.log4cats.Logger
 import skunk._
 
@@ -22,13 +23,15 @@ final class TransactionStream[F[_]](
   orders: Queue[F, OrderRow],
   session: Resource[F, Session[F]],
   transactionCounter: Ref[F, Int], // updated if long IO succeeds
-  stateManager: StateManager[F]    // utility for state management
+  stateManager: StateManager[F],   // utility for state management
+  maxConcurrent: Int
 )(implicit F: Async[F], logger: Logger[F]) {
 
   def stream: Stream[F, Unit] = {
     Stream
       .fromQueueUnterminated(orders)
-      .evalMap(processUpdate)
+      .parEvalMap(maxConcurrent)(processUpdate)
+      .handleErrorWith(_ => Stream.empty)
   }
 
   private def streamRemaining: F[Unit] =
@@ -53,6 +56,8 @@ final class TransactionStream[F[_]](
                  )
             // Get current known order state
             state <- stateManager.getOrderState(updatedOrder, queries)
+            // filled order validation
+            _ <- orderValidation(state.filled != state.total, "Order is already filled")
             // outdated order validation
             _ <- orderValidation(updatedOrder.filled >= state.filled, "Order is outdated")
             transaction = TransactionRow(state = state, updated = updatedOrder)
@@ -60,15 +65,22 @@ final class TransactionStream[F[_]](
             params = updatedOrder.filled *: state.orderId *: EmptyTuple
             _ <- performLongRunningOperation(transaction)
           } yield {
-            if (updatedOrder.filled != state.filled) // TODO check on this...kinda
+            if (updatedOrder.filled != state.filled) // TODO check on this...
               queries.insertTransaction.execute(transaction).void >>
                 queries.updateOrder.execute(params).void
             else F.unit
           }).foldF(
             {
               case _: OrderNotFoundException if Instant.now().isBefore(updatedOrder.updatedAt.plusSeconds(5)) =>
-                orders.offer(updatedOrder) // TODO add a 1s timer and launch in background
-              case err => logger.error(err)("An error occurred during order processing")
+                orders.offer(updatedOrder)
+              case _: OrderNotFoundException =>
+                logger.warn(s"Order ${updatedOrder.orderId} not received after 5 seconds. Dropping update.")
+              case ve: ValidationException => logger.error(ve)("An error occurred during order processing")
+              case e: Exception =>
+                logger.error(e)("Long running application failed")
+              case err: Error =>
+                logger.error(err)("Fatal error occurred. Shutting down application") >>
+                  F.raiseError[Unit](err)
             },
             identity
           )
@@ -81,11 +93,10 @@ final class TransactionStream[F[_]](
       .cond[F](
         p,
         (),
-        new Exception(validationMessage)
+        ValidationException(new Exception(validationMessage))
       )
       .leftWiden[Throwable]
 
-  // FIXME is the transaction actor really tied to the success of the "long running operation" ???
   // represents some long running IO that can fail
   private def performLongRunningOperation(transaction: TransactionRow): EitherT[F, Throwable, Unit] = {
     EitherT(for {
@@ -117,7 +128,8 @@ object TransactionStream {
 
   def apply[F[_]: Async: Logger](
     operationTimer: FiniteDuration,
-    session: Resource[F, Session[F]]
+    session: Resource[F, Session[F]],
+    maxConcurrent: Int
   ): Resource[F, TransactionStream[F]] = {
     Resource.make {
       for {
@@ -129,27 +141,12 @@ object TransactionStream {
         queue,
         session,
         counter,
-        stateManager
+        stateManager,
+        maxConcurrent
       )
     }(_.streamRemaining)
   }
 
-  def apply2[F[_]: Async: Logger](
-    operationTimer: FiniteDuration,
-    session: Resource[F, Session[F]]
-  ): Resource[F, TransactionStream[F]] = {
-    Resource.eval {
-      for {
-        counter      <- Ref.of(0)
-        queue        <- Queue.unbounded[F, OrderRow]
-        stateManager <- StateManager.apply
-      } yield new TransactionStream[F](
-        operationTimer,
-        queue,
-        session,
-        counter,
-        stateManager
-      )
-    }
-  }
+  final case class ValidationException(e: Exception) extends Throwable
+
 }

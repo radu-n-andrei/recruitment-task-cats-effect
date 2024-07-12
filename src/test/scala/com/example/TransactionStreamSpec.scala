@@ -435,15 +435,15 @@ class TransactionStreamSpec extends FixtureAsyncWordSpec with BaseIOSpec with Op
             _ <- stream.addNewOrder(order, insertO)
             // run the stream and process the update
             streamFiber <- stream.stream.compile.drain.start
-            _ <- stream.publish(firstUpdate)
-            _ <- IO.sleep(3.seconds)
-            _ <- streamFiber.cancel
-            results <- getResults(stream, getO, getT)
+            _           <- stream.publish(firstUpdate)
+            _           <- IO.sleep(3.seconds)
+            _           <- streamFiber.cancel
+            results     <- getResults(stream, getO, getT)
           } yield results
         }
         test.map { case Result(counter, orders, transactions) =>
           val updated = orders.find(_.orderId == order.orderId).value
-          val txn = transactions.find(_.orderId == order.orderId)
+          val txn     = transactions.find(_.orderId == order.orderId)
 
           counter shouldBe 0
           updated.filled shouldBe 0
@@ -451,7 +451,7 @@ class TransactionStreamSpec extends FixtureAsyncWordSpec with BaseIOSpec with Op
         }
       }
 
-      "T11: process an amount larger tha the total resulting in no transactions" in { fxt =>
+      "T12: process an amount larger tha the total resulting in no transactions" in { fxt =>
         val ts = Instant.now
         val order = OrderRow(
           orderId = "example_id",
@@ -470,29 +470,115 @@ class TransactionStreamSpec extends FixtureAsyncWordSpec with BaseIOSpec with Op
             _ <- stream.addNewOrder(order, insertO)
             // run the stream and process the update
             streamFiber <- stream.stream.compile.drain.start
-            _ <- stream.publish(firstUpdate)
-            _ <- IO.sleep(3.seconds)
-            _ <- streamFiber.cancel
-            results <- getResults(stream, getO, getT)
+            _           <- stream.publish(firstUpdate)
+            _           <- IO.sleep(3.seconds)
+            _           <- streamFiber.cancel
+            results     <- getResults(stream, getO, getT)
           } yield results
         }
         test.map { case Result(counter, orders, transactions) =>
           val updated = orders.find(_.orderId == order.orderId).value
-          val txn = transactions.find(_.orderId == order.orderId)
+          val txn     = transactions.find(_.orderId == order.orderId)
 
           counter shouldBe 0
           updated.filled shouldBe 0
           txn shouldBe empty
         }
       }
+
+      "T13: orders with different orderIds should be processed in parallel" in { fxt =>
+        val ts = Instant.now
+        val order1 = OrderRow(
+          orderId = "example_id_1",
+          market = "btc_eur",
+          total = 0.8,
+          filled = 0,
+          createdAt = ts,
+          updatedAt = ts
+        )
+
+        val order2 = order1.copy(orderId = "example_id_2")
+
+        val firstUpdateO1 = order1.copy(filled = 0.8)
+        val firstUpdateO2 = order2.copy(filled = 0.8)
+
+        val test = getResources(fxt, 1.seconds).use { case Resources(stream, getO, getT, insertO, _) =>
+          for {
+            // establish state
+            _ <- stream.addNewOrder(order1, insertO)
+            _ <- stream.addNewOrder(order2, insertO)
+            // run the stream and process the update
+            streamFiber <- stream.stream.compile.drain.start
+            _           <- stream.publish(firstUpdateO1)
+            _           <- stream.publish(firstUpdateO2)
+            _           <- IO.sleep(1.seconds)
+            _           <- streamFiber.cancel
+            results     <- getResults(stream, getO, getT)
+          } yield results
+        }
+        test.map { case Result(counter, orders, transactions) =>
+          val updated1 = orders.find(_.orderId == order1.orderId).value
+          val txn1     = transactions.find(_.orderId == order1.orderId)
+          val updated2 = orders.find(_.orderId == order2.orderId).value
+          val txn2     = transactions.find(_.orderId == order2.orderId)
+
+          counter shouldBe 2
+          updated1.filled shouldBe 0.8
+          updated2.filled shouldBe 0.8
+          txn1.map(_.amount) shouldBe Some(0.8)
+          txn2.map(_.amount) shouldBe Some(0.8)
+        }
+      }
     }
+
+    "T14: orders with the same orderIds should be processed in sequence" in { fxt =>
+      val ts = Instant.now
+      val order = OrderRow(
+        orderId = "example_id_1",
+        market = "btc_eur",
+        total = 0.8,
+        filled = 0,
+        createdAt = ts,
+        updatedAt = ts
+      )
+
+      val firstUpdateO1 = order.copy(filled = 0.3)
+      val firstUpdateO2 = order.copy(filled = 0.8)
+
+      val test = getResources(fxt, 1.seconds).use { case Resources(stream, getO, getT, insertO, _) =>
+        for {
+          // establish state
+          _ <- stream.addNewOrder(order, insertO)
+          // run the stream and process the update
+          streamFiber         <- stream.stream.compile.drain.start
+          _                   <- stream.publish(firstUpdateO1)
+          _                   <- stream.publish(firstUpdateO2)
+          _                   <- IO.sleep(1300.millis)
+          intermediaryCounter <- stream.getCounter
+          _                   <- IO.sleep(1.seconds)
+          _                   <- streamFiber.cancel
+          results             <- getResults(stream, getO, getT)
+        } yield (results, intermediaryCounter)
+      }
+      test.map { case (Result(counter, orders, transactions), intermediaryCounter) =>
+        val updated = orders.find(_.orderId == order.orderId).value
+        val txn     = transactions.find(_.orderId == order.orderId)
+
+        intermediaryCounter shouldBe 1
+        counter shouldBe 2
+        updated.filled shouldBe 0.8
+        txn.map(_.amount) shouldBe Some(0.8)
+      }
+    }
+
   }
 
   // timer for long IO operation
   def getResources(
     fxt: FixtureParam,
     timer: FiniteDuration,
-    withTruncate: Boolean = true
+    withTruncate: Boolean = true,
+    maxConcurrent: Int = 2
   ): Resource[IO, Resources] = {
     for {
       _                 <- Resource.eval(IO.whenA(withTruncate)(truncateAllTables(fxt.databasePool)))
@@ -500,7 +586,7 @@ class TransactionStreamSpec extends FixtureAsyncWordSpec with BaseIOSpec with Op
       selectTransaction <- fxt.databasePool.sessionResource.evalMap(_.prepare(Queries.getAllTransactions))
       insertOrder       <- fxt.databasePool.sessionResource.evalMap(_.prepare(Queries.insertOrder))
       insertTransaction <- fxt.databasePool.sessionResource.evalMap(_.prepare(Queries.insertTransaction))
-      stream            <- TransactionStream.apply(timer, fxt.databasePool.sessionResource)
+      stream            <- TransactionStream.apply(timer, fxt.databasePool.sessionResource, maxConcurrent)
     } yield Resources(stream, selectOrder, selectTransaction, insertOrder, insertTransaction)
   }
 

@@ -3,7 +3,7 @@ package com.example
 import cats.effect.{Async, IO, IOApp}
 import cats.effect.kernel.Resource
 import cats.effect.std.Console
-import com.example.config.DatabaseConfig
+import com.example.config.{DatabaseConfig, TransactionConfig}
 import com.example.persistence.{DatabasePool, FlywayMigration}
 import com.example.stream.TransactionStream
 import org.typelevel.log4cats.Logger
@@ -17,7 +17,8 @@ object Main extends IOApp.Simple {
   implicit val console: Console[F] = IO.consoleForIO
   implicit val async: Async[F]     = IO.asyncForIO
 
-  private val databaseConfig = DatabaseConfig()
+  private val databaseConfig              = DatabaseConfig()
+  private val transactionProcessingConfig = TransactionConfig()
 
   def run: IO[Unit] = {
 
@@ -30,7 +31,7 @@ object Main extends IOApp.Simple {
 
       val streams = for {
         _      <- Resource.eval(FlywayMigration.migrate(databaseConfig))
-        stream <- TransactionStream(1.second, pool.sessionResource)
+        stream <- TransactionStream(1.second, pool.sessionResource, transactionProcessingConfig.maxConcurrent)
       } yield new Streams(stream)
 
       streams.use(_.run)
