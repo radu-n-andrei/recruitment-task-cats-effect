@@ -415,6 +415,76 @@ class TransactionStreamSpec extends FixtureAsyncWordSpec with BaseIOSpec with Op
           txn.map(_.amount).sum shouldBe 0.8
         }
       }
+
+      "T11: process negative amount update resulting in no transactions" in { fxt =>
+        val ts = Instant.now
+        val order = OrderRow(
+          orderId = "example_id",
+          market = "btc_eur",
+          total = 0.8,
+          filled = 0,
+          createdAt = ts,
+          updatedAt = ts
+        )
+
+        val firstUpdate = order.copy(filled = -1)
+
+        val test = getResources(fxt, 100.millis).use { case Resources(stream, getO, getT, insertO, _) =>
+          for {
+            // establish state
+            _ <- stream.addNewOrder(order, insertO)
+            // run the stream and process the update
+            streamFiber <- stream.stream.compile.drain.start
+            _ <- stream.publish(firstUpdate)
+            _ <- IO.sleep(3.seconds)
+            _ <- streamFiber.cancel
+            results <- getResults(stream, getO, getT)
+          } yield results
+        }
+        test.map { case Result(counter, orders, transactions) =>
+          val updated = orders.find(_.orderId == order.orderId).value
+          val txn = transactions.find(_.orderId == order.orderId)
+
+          counter shouldBe 0
+          updated.filled shouldBe 0
+          txn shouldBe empty
+        }
+      }
+
+      "T11: process an amount larger tha the total resulting in no transactions" in { fxt =>
+        val ts = Instant.now
+        val order = OrderRow(
+          orderId = "example_id",
+          market = "btc_eur",
+          total = 0.8,
+          filled = 0,
+          createdAt = ts,
+          updatedAt = ts
+        )
+
+        val firstUpdate = order.copy(filled = 1)
+
+        val test = getResources(fxt, 100.millis).use { case Resources(stream, getO, getT, insertO, _) =>
+          for {
+            // establish state
+            _ <- stream.addNewOrder(order, insertO)
+            // run the stream and process the update
+            streamFiber <- stream.stream.compile.drain.start
+            _ <- stream.publish(firstUpdate)
+            _ <- IO.sleep(3.seconds)
+            _ <- streamFiber.cancel
+            results <- getResults(stream, getO, getT)
+          } yield results
+        }
+        test.map { case Result(counter, orders, transactions) =>
+          val updated = orders.find(_.orderId == order.orderId).value
+          val txn = transactions.find(_.orderId == order.orderId)
+
+          counter shouldBe 0
+          updated.filled shouldBe 0
+          txn shouldBe empty
+        }
+      }
     }
   }
 

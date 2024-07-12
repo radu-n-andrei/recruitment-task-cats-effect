@@ -13,7 +13,8 @@ import org.typelevel.log4cats.Logger
 import skunk._
 
 import java.time.Instant
-import scala.concurrent.duration.FiniteDuration
+import java.util.concurrent.TimeUnit
+import scala.concurrent.duration.{Duration, FiniteDuration}
 
 // All SQL queries inside the Queries object are correct and should not be changed
 final class TransactionStream[F[_]](
@@ -44,14 +45,20 @@ final class TransactionStream[F[_]](
       PreparedQueries(session)
         .use { queries =>
           (for {
+            // trivial input validation
+            _ <- orderValidation(
+                   updatedOrder.filled > 0
+                     && updatedOrder.filled <= updatedOrder.total,
+                   "Order update has incorrect arguments"
+                 )
             // Get current known order state
             state <- stateManager.getOrderState(updatedOrder, queries)
+            // outdated order validation
+            _ <- orderValidation(updatedOrder.filled >= state.filled, "Order is outdated")
             transaction = TransactionRow(state = state, updated = updatedOrder)
             // parameters for order update
             params = updatedOrder.filled *: state.orderId *: EmptyTuple
-            _ <- if (updatedOrder.filled > 0) // TODO move conditions higher up 1st line in an EitherCond
-                   performLongRunningOperation(transaction)
-                 else EitherT.rightT[F, Throwable](())
+            _ <- performLongRunningOperation(transaction)
           } yield {
             if (updatedOrder.filled != state.filled) // TODO check on this...kinda
               queries.insertTransaction.execute(transaction).void >>
@@ -68,6 +75,15 @@ final class TransactionStream[F[_]](
         }
     )
   }
+
+  private def orderValidation(p: Boolean, validationMessage: String): EitherT[F, Throwable, Unit] =
+    EitherT
+      .cond[F](
+        p,
+        (),
+        new Exception(validationMessage)
+      )
+      .leftWiden[Throwable]
 
   // FIXME is the transaction actor really tied to the success of the "long running operation" ???
   // represents some long running IO that can fail
