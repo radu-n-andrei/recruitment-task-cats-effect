@@ -511,7 +511,7 @@ class TransactionStreamSpec extends FixtureAsyncWordSpec with BaseIOSpec with Op
             streamFiber <- stream.stream.compile.drain.start
             _           <- stream.publish(firstUpdateO1)
             _           <- stream.publish(firstUpdateO2)
-            _           <- IO.sleep(1.seconds)
+            _           <- IO.sleep(1100.millis)
             _           <- streamFiber.cancel
             results     <- getResults(stream, getO, getT)
           } yield results

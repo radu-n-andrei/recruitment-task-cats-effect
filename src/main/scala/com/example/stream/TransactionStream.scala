@@ -9,12 +9,13 @@ import com.example.model.{OrderRow, TransactionRow}
 import com.example.persistence.PreparedQueries
 import com.example.stream.StateManager.OrderNotFoundException
 import com.example.stream.TransactionStream.ValidationException
-import fs2.{Pipe, Stream}
+import fs2.Stream
 import org.typelevel.log4cats.Logger
 import skunk._
 
 import java.time.Instant
-import java.util.concurrent.TimeUnit
+import java.util.concurrent.{Executors, TimeUnit}
+import scala.concurrent.ExecutionContext
 import scala.concurrent.duration.{Duration, FiniteDuration}
 
 // All SQL queries inside the Queries object are correct and should not be changed
@@ -27,6 +28,7 @@ final class TransactionStream[F[_]](
   maxConcurrent: Int
 )(implicit F: Async[F], logger: Logger[F]) {
 
+  private val rescheduleEx: ExecutionContext = ExecutionContext.fromExecutorService(Executors.newSingleThreadExecutor())
   def stream: Stream[F, Unit] = {
     Stream
       .fromQueueUnterminated(orders)
@@ -72,7 +74,11 @@ final class TransactionStream[F[_]](
           }).foldF(
             {
               case _: OrderNotFoundException if Instant.now().isBefore(updatedOrder.updatedAt.plusSeconds(5)) =>
-                orders.offer(updatedOrder)
+                F.backgroundOn(
+                  F.sleep(FiniteDuration(100, TimeUnit.MILLISECONDS)) >> orders.offer(updatedOrder),
+                  rescheduleEx
+                ).useEval
+                  .void
               case _: OrderNotFoundException =>
                 logger.warn(s"Order ${updatedOrder.orderId} not received after 5 seconds. Dropping update.")
               case ve: ValidationException => logger.error(ve)("An error occurred during order processing")
@@ -147,6 +153,8 @@ object TransactionStream {
     }(_.streamRemaining)
   }
 
-  final case class ValidationException(e: Exception) extends Throwable
+  final case class ValidationException(e: Exception) extends Throwable {
+    override def getMessage = e.getMessage
+  }
 
 }
