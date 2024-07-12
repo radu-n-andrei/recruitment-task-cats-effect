@@ -40,18 +40,26 @@ final class TransactionStream[F[_]](
           state <- stateManager.getOrderState(updatedOrder, queries)
           transaction = TransactionRow(state = state, updated = updatedOrder)
           // parameters for order update
-          params = state.filled *: state.orderId *: EmptyTuple
-          // update order with params
-          _ <- queries.updateOrder.execute(params)
-          // insert the transaction
-          _ <- queries.insertTransaction.execute(transaction)
-          _ <- performLongRunningOperation(transaction).value.void.handleErrorWith(th =>
-                 logger.error(th)(s"Got error when performing long running IO!")
-               )
+          params = updatedOrder.filled *: state.orderId *: EmptyTuple
+          _ <- if (updatedOrder.filled > 0)
+                 performLongRunningOperation(transaction)
+                   .foldF(
+                     t => logger.warn(t)("Long running operation failed"), // nothing on left yet
+                     _ =>
+                       if (updatedOrder.filled != state.filled)
+                         queries.insertTransaction.execute(transaction).void >> // might need to check that both work
+                           queries.updateOrder.execute(params).void
+                       else F.unit
+                   )
+                   .void
+                   .handleErrorWith(th => logger.error(th)(s"Got error when performing long running IO!"))
+               else F.unit
         } yield ()
       }
   }
 
+  // FIXME is the transaction actor really tied to the success of the "long running operation" ???
+  // FIXME so far (T1->5) EitherT has no purpose here. it will lift the result as a Right...
   // represents some long running IO that can fail
   private def performLongRunningOperation(transaction: TransactionRow): EitherT[F, Throwable, Unit] = {
     EitherT.liftF[F, Throwable, Unit](

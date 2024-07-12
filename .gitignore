@@ -48,3 +48,9 @@ Thumbs.db
 *.mov
 *.wmv
 
+# VSCode
+.metals
+.vscode
+.bloop
+metals.*
+.bsp
