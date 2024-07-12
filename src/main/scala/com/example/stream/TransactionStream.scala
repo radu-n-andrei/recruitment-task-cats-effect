@@ -1,17 +1,18 @@
 package com.example.stream
 
 import cats.data.EitherT
-import cats.effect.{Ref, Resource}
 import cats.effect.kernel.Async
-import cats.effect.kernel.Resource.ExitCase
 import cats.effect.std.Queue
-import fs2.Stream
-import org.typelevel.log4cats.Logger
+import cats.effect.{Ref, Resource}
 import cats.syntax.all._
 import com.example.model.{OrderRow, TransactionRow}
 import com.example.persistence.PreparedQueries
+import com.example.stream.StateManager.OrderNotFoundException
+import fs2.Stream
+import org.typelevel.log4cats.Logger
 import skunk._
 
+import java.time.Instant
 import scala.concurrent.duration.FiniteDuration
 
 // All SQL queries inside the Queries object are correct and should not be changed
@@ -27,11 +28,6 @@ final class TransactionStream[F[_]](
     Stream
       .fromQueueUnterminated(orders)
       .evalMap(processUpdate)
-      .onFinalize(
-        streamRemaining
-      )
-    /* .onFinalizeCase { case ExitCase.Succeeded => logger.info("SUCCEED") case ExitCase.Errored(e) =>
-     * logger.info("ERRRRR") case ExitCase.Canceled => logger.info("CANCELLED") } */
   }
 
   private def streamRemaining: F[Unit] =
@@ -47,36 +43,38 @@ final class TransactionStream[F[_]](
     F.uncancelable(_ =>
       PreparedQueries(session)
         .use { queries =>
-          for {
+          (for {
             // Get current known order state
             state <- stateManager.getOrderState(updatedOrder, queries)
             transaction = TransactionRow(state = state, updated = updatedOrder)
             // parameters for order update
             params = updatedOrder.filled *: state.orderId *: EmptyTuple
-            _ <- if (updatedOrder.filled > 0)
+            _ <- if (updatedOrder.filled > 0) // TODO move conditions higher up 1st line in an EitherCond
                    performLongRunningOperation(transaction)
-                     .foldF(
-                       t => logger.warn(t)("Long running operation failed"), // nothing on left yet
-                       _ =>
-                         if (updatedOrder.filled != state.filled)
-                           queries.insertTransaction.execute(transaction).void >> // might need to check that both work
-                             queries.updateOrder.execute(params).void
-                         else F.unit
-                     )
-                     .void
-                     .handleErrorWith(th => logger.error(th)(s"Got error when performing long running IO!"))
-                 else F.unit
-          } yield ()
+                 else EitherT.rightT[F, Throwable](())
+          } yield {
+            if (updatedOrder.filled != state.filled) // TODO check on this...kinda
+              queries.insertTransaction.execute(transaction).void >>
+                queries.updateOrder.execute(params).void
+            else F.unit
+          }).foldF(
+            {
+              case _: OrderNotFoundException if Instant.now().isBefore(updatedOrder.updatedAt.plusSeconds(5)) =>
+                orders.offer(updatedOrder) // TODO add a 1s timer and launch in background
+              case err => logger.error(err)("An error occurred during order processing")
+            },
+            identity
+          )
         }
     )
   }
 
   // FIXME is the transaction actor really tied to the success of the "long running operation" ???
-  // FIXME so far (T1->5) EitherT has no purpose here. it will lift the result as a Right...
   // represents some long running IO that can fail
   private def performLongRunningOperation(transaction: TransactionRow): EitherT[F, Throwable, Unit] = {
-    EitherT.liftF[F, Throwable, Unit](
-      F.sleep(operationTimer) *>
+    EitherT(for {
+      _ <- F.sleep(operationTimer).attempt.widen[Either[Throwable, Unit]]
+      t <-
         stateManager.getSwitch.flatMap {
           case false =>
             transactionCounter
@@ -85,10 +83,10 @@ final class TransactionStream[F[_]](
                 logger.info(
                   s"Updated counter to $count by transaction with amount ${transaction.amount} for order ${transaction.orderId}!"
                 )
-              )
-          case true => F.raiseError(throw new Exception("Long running IO failed!"))
+              ) map (_.asRight[Throwable])
+          case true => F.pure[Either[Throwable, Unit]](new Exception("Long running IO failed!").asLeft)
         }
-    )
+    } yield t)
   }
 
   // helper methods for testing
