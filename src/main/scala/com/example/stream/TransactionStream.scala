@@ -9,7 +9,7 @@ import com.example.model.{OrderRow, TransactionRow}
 import com.example.persistence.PreparedQueries
 import com.example.stream.StateManager.OrderNotFoundException
 import com.example.stream.TransactionStream.ValidationException
-import fs2.Stream
+import fs2.{Chunk, Pipe, Pull, Pure, Stream}
 import org.typelevel.log4cats.Logger
 import skunk._
 
@@ -29,16 +29,55 @@ final class TransactionStream[F[_]](
 )(implicit F: Async[F], logger: Logger[F]) {
 
   private val rescheduleEx: ExecutionContext = ExecutionContext.fromExecutorService(Executors.newSingleThreadExecutor())
+
   def stream: Stream[F, Unit] = {
     Stream
       .fromQueueUnterminated(orders)
-      .parEvalMap(maxConcurrent)(processUpdate)
+      .through(partitionPipe)
+      .flatMap { o =>
+        Stream.emits[F, OrderRow](o).parEvalMap(maxConcurrent)(processUpdate)
+      }
       .handleErrorWith(_ => Stream.empty)
+  }
+
+  private val partitionPipe: Pipe[F, OrderRow, List[OrderRow]] = {
+    def go(
+      s: Stream.ToPull[F, OrderRow],
+      acc: List[OrderRow],
+      maxTolerance: Int
+    ): Pull[F, List[OrderRow], Option[Stream[F, OrderRow]]] = {
+      s.uncons
+        .flatMap {
+          case _ if maxTolerance == 0 =>
+            Pull.output(Chunk(acc)).map(_ => Some(s.echo.stream))
+          case None =>
+            Pull.output(Chunk(acc)).map(_ => None)
+          case Some((ch, tail)) =>
+            val l = acc.length
+            val (valid, invalid) = ch.foldLeft((List.empty[OrderRow], List.empty[OrderRow])) { case (a, i) =>
+              if (acc.exists(o => o.orderId == i.orderId) || a._1.exists(_.orderId == i.orderId)) (a._1, a._2 :+ i)
+              else (a._1 :+ i, a._2)
+            }
+            val taking          = valid.take(maxConcurrent - l)
+            val remaining       = valid.drop(maxConcurrent - l) ++ invalid
+            val remainingStream = if (remaining.isEmpty) tail else Stream.emits(remaining) ++ tail
+            if (acc.length + taking.length == maxConcurrent)
+              Pull.output(Chunk(acc ++ taking)).map(_ => Some(remainingStream))
+            else {
+              // be cautious and produce something otherwise uncons might get stuck waiting
+              if (remaining.isEmpty && taking.nonEmpty)
+                Pull.output(Chunk(acc ++ taking)).map(_ => Some(tail))
+              else
+                go(remainingStream.pull, acc ++ taking, maxTolerance - 1)
+            }
+        }
+    }
+    in => in.repeatPull(x => go(x, List.empty, 3))
   }
 
   private def streamRemaining: F[Unit] =
     orders.size.flatMap { s =>
-      Stream.fromQueueUnterminated(orders).evalMap(processUpdate).take(s).compile.drain
+      stream.take(s).compile.drain
     }
 
   // Application should shut down on error,
