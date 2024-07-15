@@ -145,7 +145,7 @@ final class TransactionStream[F[_]](
   // represents some long running IO that can fail
   private def performLongRunningOperation(transaction: TransactionRow): EitherT[F, Throwable, Unit] = {
     EitherT(for {
-      _ <- F.sleep(operationTimer).attempt.widen[Either[Throwable, Unit]]
+      _ <- F.sleep(operationTimer).attempt
       t <-
         stateManager.getSwitch.flatMap {
           case false =>
